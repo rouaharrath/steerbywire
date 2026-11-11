@@ -1,0 +1,134 @@
+/* USER CODE BEGIN Includes */
+#include <string.h>
+#include <stdio.h>
+/* USER CODE END Includes */
+
+/* USER CODE BEGIN PV */
+typedef struct {
+    uint16_t angle1;      // Mesure potentiomètre 1
+    uint16_t angle2;      // Mesure potentiomètre 2
+    uint8_t  status;      // État de santé / désaccord
+    uint8_t  counter;     // Compteur de trame (Rolling counter)
+    uint8_t  crc;         // Code de redondance cyclique reçu
+} SteerDataFrame_t;
+
+extern CAN_HandleTypeDef hcan1;
+extern TIM_HandleTypeDef htim2; // Timer utilisé pour le PWM du servomoteur
+
+uint8_t last_received_counter = 0;
+uint8_t error_counter = 0;
+#define MAX_CONSECUTIVE_ERRORS 5
+/* USER CODE END PV */
+
+/* USER CODE BEGIN PFP */
+uint8_t Calculate_CRC8(uint8_t *data, uint8_t length);
+void Process_Steer_Command(uint16_t angle);
+/* USER CODE END PFP */
+
+int main(void)
+{
+  HAL_Init();
+  SystemClock_Config();
+  MX_GPIO_Init();
+  MX_CAN1_Init();
+  MX_TIM2_Init(); // Initialisation du PWM pour le servomoteur
+
+  /* USER CODE BEGIN 2 */
+  // 1. Démarrage du PWM pour le servomoteur
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+
+  // 2. Configuration des filtres CAN et activation des interruptions
+  CAN_FilterTypeDef sFilterConfig;
+  sFilterConfig.FilterBank = 0;
+  sFilterConfig.FilterMode = CAN_FILTERMODE_IDMASK;
+  sFilterConfig.FilterScale = CAN_FILTERSCALE_32BIT;
+  sFilterConfig.FilterIdHigh = 0x0000;
+  sFilterConfig.FilterIdLow = 0x0000;
+  sFilterConfig.FilterMaskIdHigh = 0x0000;
+  sFilterConfig.FilterMaskIdLow = 0x0000;
+  sFilterConfig.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+  sFilterConfig.FilterActivation = ENABLE;
+  
+  HAL_CAN_ConfigFilter(&hcan1, &sFilterConfig);
+  HAL_CAN_Start(&hcan1);
+  
+  // Activer l'interruption de réception FIFO 0
+  HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
+  /* USER CODE END 2 */
+
+  while (1)
+  {
+      // La boucle principale peut gérer le mode dégradé si le bus CAN est muet
+      HAL_Delay(100);
+  }
+}
+
+/* USER CODE BEGIN 4 */
+
+// Fonction de calcul CRC-8 (identique à l'émetteur)
+uint8_t Calculate_CRC8(uint8_t *data, uint8_t length) {
+    uint8_t crc = 0xFF;
+    for (uint8_t i = 0; i < length; i++) {
+        crc ^= data[i];
+        for (uint8_t j = 0; j < 8; j++) {
+            if (crc & 0x80)
+                crc = (crc << 1) ^ 0x31;
+            else
+                crc <<= 1;
+        }
+    }
+    return crc;
+}
+
+// Interruption de réception CAN : déclenchée dès qu'une trame arrive de l'ECU Capteur ou d'un attaquant
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
+    CAN_RxHeaderTypeDef rxHeader;
+    uint8_t rxData[8];
+
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK) {
+        // Filtrer par ID CAN attendu (ex: 0x100)
+        if (rxHeader.StdId == 0x100) {
+            SteerDataFrame_t *received_frame = (SteerDataFrame_t *)rxData;
+
+            // 1. Vérification du CRC sur les 6 premiers octets
+            uint8_t calculated_crc = Calculate_CRC8(rxData, 6);
+
+            // 2. Vérification du Compteur (Protection E2E contre le rejeu / falsification)
+            // Le compteur doit s'incrémenter logiquement par rapport au précédent
+            int8_t counter_diff = (int8_t)(received_frame->counter - last_received_counter);
+
+            if ((calculated_crc == received_frame->crc) && (counter_diff > 0)) {
+                // Trame VALIDE : Mise à jour du compteur de séquence
+                last_received_counter = received_frame->counter;
+                error_counter = 0; // Reset des erreurs
+
+                // Choix de l'angle (redondance : si capteur 1 OK, sinon capteur 2 de secours)
+                uint16_t active_angle = (received_frame->status == 0) ? received_frame->angle1 : received_frame->angle2;
+
+                // Piloter le servomoteur avec l'angle validé
+                Process_Steer_Command(active_angle);
+            } 
+            else {
+                // Trame INVALIDE (CRC faux, trame falsifiée par un attaquant ou rupture de séquence)
+                error_counter++;
+                
+                // Si trop d'échecs consécutifs, passage en état sûr (immobilisation du servomoteur)
+                if (error_counter >= MAX_CONSECUTIVE_ERRORS) {
+                    // État sûr : fixer le servomoteur en position neutre (centre)
+                    Process_Steer_Command(2048); 
+                }
+            }
+        }
+    }
+}
+
+// Fonction de conversion de l'angle (0 - 4095) vers le PWM du servomoteur (ex: 1ms à 2ms)
+void Process_Steer_Command(uint16_t angle) {
+    // Conversion linéaire de l'ADC (0 à 4095) en impulsion Timer (ex: CCR de 500 à 2500 pour un servo standard)
+    uint32_t pwm_val = 500 + ((uint32_t)angle * 2000) / 4095;
+    
+    // Application de la valeur sur le canal PWM du Timer
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, pwm_val);
+}
+
+/* USER CODE END 4 */
